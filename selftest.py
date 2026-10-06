@@ -174,6 +174,16 @@ def close_session(client, host_token):
     return client.post(f"/api/h/{host_token}/close")
 
 
+def set_consent(client, token, consent):
+    return client.post(
+        f"/api/p/{token}/anthology-consent", json={"consent": consent}
+    )
+
+
+def publish_anthology(client, host_token, names):
+    return client.post(f"/api/h/{host_token}/anthology", json={"names": names})
+
+
 def host_state(client, host_token):
     resp = client.get(f"/api/h/{host_token}")
     assert resp.status_code == 200, resp.get_json()
@@ -2281,6 +2291,436 @@ class CloseSessionTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
 
 
+class AnthologyTest(unittest.TestCase):
+    """匿名合辑：授权/撤回、发布门槛、提交顺序、公开只读、冻结、封存共存与持久化。"""
+
+    def setUp(self):
+        self.client = new_client()
+        self.names = ["甲", "乙", "丙"]
+        self.host_token, self.tokens = create_named_session(self.client, self.names)
+        publish_with_reviews(
+            self.client, self.host_token, [self.tokens[n] for n in self.names]
+        )
+
+    def host_reviewers(self):
+        return host_state(self.client, self.host_token)["reviewers"]
+
+    def consents(self):
+        return [r["anthology_consent"] for r in self.host_reviewers()]
+
+    def test_consent_flow_and_status_visibility(self):
+        # 初始均未授权：参与状态（本人）与主持状态（各人）同快照返回
+        for n in self.names:
+            self.assertIs(state(self.client, self.tokens[n])["anthology_consent"], False)
+        hs = host_state(self.client, self.host_token)
+        self.assertEqual([r["anthology_consent"] for r in hs["reviewers"]], [False] * 3)
+        self.assertIsNone(hs["anthology_url"])
+
+        # 甲授权：只有甲的授权变化，主持台按留存名单原顺序展示各人授权
+        resp = set_consent(self.client, self.tokens["甲"], True)
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(resp.get_json(), {"ok": True, "consent": True})
+        self.assertIs(state(self.client, self.tokens["甲"])["anthology_consent"], True)
+        self.assertIs(state(self.client, self.tokens["乙"])["anthology_consent"], False)
+        self.assertEqual(self.consents(), [True, False, False])
+
+        # 参与状态只返回本人授权：响应中只有一个授权字段，且不含公开链接字段
+        body = self.client.get(f"/api/p/{self.tokens['乙']}").get_data(as_text=True)
+        self.assertEqual(body.count("anthology_consent"), 1)
+        self.assertNotIn("anthology_url", body)
+
+        # 撤回：甲回到未授权
+        resp = set_consent(self.client, self.tokens["甲"], False)
+        self.assertEqual(resp.get_json(), {"ok": True, "consent": False})
+        self.assertEqual(self.consents(), [False, False, False])
+
+    def test_consent_request_rules(self):
+        # 请求体非法 400：缺 consent、非布尔
+        for payload in [{}, {"consent": "true"}, {"consent": 1}, {"consent": None}]:
+            resp = self.client.post(
+                f"/api/p/{self.tokens['甲']}/anthology-consent", json=payload
+            )
+            self.assertEqual(resp.status_code, 400, payload)
+        # 无效个人链接 404
+        self.assertEqual(set_consent(new_client(), "无效链接", True).status_code, 404)
+        # 失败均不留变更
+        self.assertIs(state(self.client, self.tokens["甲"])["anthology_consent"], False)
+
+        # 公布前（另一会话）：授权 409、发布 409，且不留合辑
+        client2 = new_client()
+        host2, toks2 = create_session(client2)
+        self.assertEqual(set_consent(client2, toks2[0], True).status_code, 409)
+        self.assertEqual(publish_anthology(client2, host2, ["甲"]).status_code, 409)
+        self.assertIsNone(host_state(client2, host2)["anthology_url"])
+        self.assertIs(state(client2, toks2[0])["anthology_consent"], False)
+
+    def test_publish_request_rules(self):
+        # 非法名单 400：缺字段、非列表、空名单、重复、空白/非字符串/超长姓名
+        for payload in [
+            {},
+            {"names": None},
+            {"names": "甲乙丙"},
+            {"names": []},
+            {"names": ["甲", "甲"]},
+            {"names": ["甲", "  "]},
+            {"names": ["甲", 1]},
+            {"names": ["甲", "x" * (app_module.MAX_NAME_LEN + 1)]},
+        ]:
+            resp = self.client.post(f"/api/h/{self.host_token}/anthology", json=payload)
+            self.assertEqual(resp.status_code, 400, payload)
+        # 无效主持链接 404；姓名不属于本会话留存成员 404
+        self.assertEqual(publish_anthology(new_client(), "假主持", ["甲"]).status_code, 404)
+        self.assertEqual(
+            publish_anthology(self.client, self.host_token, ["甲", "某人"]).status_code,
+            404,
+        )
+        # 失败不留合辑
+        self.assertIsNone(host_state(self.client, self.host_token)["anthology_url"])
+
+    def test_unconsented_selection_fails_and_leaves_nothing(self):
+        set_consent(self.client, self.tokens["甲"], True)
+        set_consent(self.client, self.tokens["乙"], True)
+        resp = publish_anthology(self.client, self.host_token, ["甲", "乙", "丙"])
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json()["missing_consent"], ["丙"])
+        # 整次失败不留合辑，授权状态不变
+        self.assertIsNone(host_state(self.client, self.host_token)["anthology_url"])
+        conn = sqlite3.connect(app_module.DB_PATH)
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM anthologies WHERE session_id="
+                "(SELECT id FROM sessions WHERE host_token=?)",
+                (self.host_token,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(count, 0)
+        self.assertEqual(self.consents(), [True, True, False])
+        # 丙补授权后重发成功：失败不冻结任何状态
+        set_consent(self.client, self.tokens["丙"], True)
+        resp = publish_anthology(self.client, self.host_token, ["甲", "乙", "丙"])
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+
+    def test_public_page_contains_only_number_and_manuscript(self):
+        client = new_client()
+        resp = client.post(
+            "/api/sessions",
+            json={
+                "people": [
+                    {"name": "甲", "manuscript": "春眠不觉晓"},
+                    {"name": "乙", "manuscript": "处处闻啼鸟"},
+                    {"name": "丙", "manuscript": "夜来风雨声"},
+                ]
+            },
+        )
+        data = resp.get_json()
+        host = data["host_url"].rsplit("/", 1)[-1]
+        toks = {p["name"]: p["url"].rsplit("/", 1)[-1] for p in data["people"]}
+        for n in ["甲", "乙", "丙"]:
+            self.assertEqual(
+                submit_review(client, toks[n], "评审意见机密" + n, 1).status_code, 200
+            )
+        self.assertEqual(client.post(f"/api/h/{host}/publish").status_code, 200)
+        # 一问一答与举报：其内容都不应出现在公开合辑中
+        self.assertEqual(ask(client, toks["甲"], "澄清问题机密").status_code, 200)
+        self.assertEqual(answer(client, toks["丙"], "澄清答复机密").status_code, 200)
+        self.assertEqual(report_review(client, toks["乙"], "举报原因机密").status_code, 200)
+        # 全部授权后乱序选择 [丙, 甲] 发布：编号按原名单顺序（甲=1、丙=2），稿文固化
+        for n in ["甲", "乙", "丙"]:
+            self.assertEqual(set_consent(client, toks[n], True).status_code, 200)
+        resp = publish_anthology(client, host, ["丙", "甲"])
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        url = resp.get_json()["url"]
+        pub = url.rsplit("/", 1)[-1]
+
+        resp = client.get(f"/api/a/{pub}")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(set(data.keys()), {"items"})
+        self.assertEqual(
+            data["items"],
+            [
+                {"number": 1, "manuscript": "春眠不觉晓"},
+                {"number": 2, "manuscript": "夜来风雨声"},
+            ],
+        )
+        for it in data["items"]:
+            self.assertEqual(set(it.keys()), {"number", "manuscript"})
+        body = resp.get_data(as_text=True)
+        # 不含姓名、私密链接、意见、问答、举报或授权记录；未入选的稿件不出现
+        for leaked in (
+            "甲", "乙", "丙",
+            "评审意见机密", "澄清问题机密", "澄清答复机密", "举报原因机密",
+            "consent", "token", host, toks["甲"], toks["乙"], toks["丙"],
+            "处处闻啼鸟",
+        ):
+            self.assertNotIn(leaked, body)
+        # 公开页面可打开；无效公开链接 404
+        resp = client.get(f"/a/{pub}")
+        self.assertEqual(resp.status_code, 200)
+        resp.close()  # 关闭静态文件句柄
+        self.assertEqual(client.get("/api/a/不存在的公开链接").status_code, 404)
+        # 主持状态可见公开链接；参与状态不含公开链接
+        self.assertEqual(host_state(client, host)["anthology_url"], url)
+        self.assertNotIn("anthology_url", state(client, toks["甲"]))
+
+    def test_freeze_after_publish(self):
+        for n in self.names:
+            set_consent(self.client, self.tokens[n], True)
+        resp = publish_anthology(self.client, self.host_token, ["甲", "丙"])
+        self.assertEqual(resp.status_code, 200)
+        pub = resp.get_json()["url"].rsplit("/", 1)[-1]
+        # 全部授权冻结：入选者与未入选者的变更一律 409
+        self.assertEqual(set_consent(self.client, self.tokens["甲"], False).status_code, 409)
+        self.assertEqual(set_consent(self.client, self.tokens["乙"], True).status_code, 409)
+        # 重复发布（相同或不同名单）一律 409
+        self.assertEqual(
+            publish_anthology(self.client, self.host_token, ["甲", "丙"]).status_code, 409
+        )
+        self.assertEqual(
+            publish_anthology(self.client, self.host_token, ["乙"]).status_code, 409
+        )
+        # 合辑内容与授权状态均保持发布时状态
+        self.assertEqual(
+            self.client.get(f"/api/a/{pub}").get_json()["items"],
+            [
+                {"number": 1, "manuscript": "稿甲"},
+                {"number": 2, "manuscript": "稿丙"},
+            ],
+        )
+        self.assertEqual(self.consents(), [True, True, True])
+
+    def test_rotate_link_keeps_consent(self):
+        set_consent(self.client, self.tokens["甲"], True)
+        old = self.tokens["甲"]
+        resp = self.client.post(
+            f"/api/h/{self.host_token}/rotate-link",
+            json={"name": "甲", "link": f"/p/{old}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        new = resp.get_json()["url"].rsplit("/", 1)[-1]
+        # 授权随原身份保留；旧链接的授权操作 404
+        self.assertIs(state(self.client, new)["anthology_consent"], True)
+        self.assertEqual(set_consent(self.client, old, False).status_code, 404)
+        # 新链接可正常撤回/再授权
+        self.assertEqual(set_consent(self.client, new, False).status_code, 200)
+        self.assertIs(state(self.client, new)["anthology_consent"], False)
+        self.assertEqual(set_consent(self.client, new, True).status_code, 200)
+        # 换发不影响发布：甲以随身份保留的授权入选
+        resp = publish_anthology(self.client, self.host_token, ["甲"])
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        # 发布后再换发链接（会话未封存仍允许）：授权仍冻结且随身份保留
+        resp = self.client.post(
+            f"/api/h/{self.host_token}/rotate-link",
+            json={"name": "甲", "link": f"/p/{new}"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        newest = resp.get_json()["url"].rsplit("/", 1)[-1]
+        self.assertIs(state(self.client, newest)["anthology_consent"], True)
+        self.assertEqual(set_consent(self.client, newest, False).status_code, 409)
+
+    def test_removed_member_cannot_be_selected(self):
+        client = new_client()
+        names = ["甲", "乙", "丙", "丁"]
+        host, toks = create_named_session(client, names)
+        for n in names:
+            s = state(client, toks[n])
+            self.assertEqual(
+                submit_review(client, toks[n], n + "评", s["assignment"]["version"]).status_code,
+                200,
+            )
+        self.assertEqual(remove_member(client, host, "乙").status_code, 200)
+        cred = state(client, toks["甲"])["assignment"]["credential"]
+        self.assertEqual(
+            submit_review(client, toks["甲"], "甲评丙", 1, credential=cred).status_code, 200
+        )
+        self.assertEqual(client.post(f"/api/h/{host}/publish").status_code, 200)
+        # 已移除成员按不存在处理 404，失败不留合辑
+        self.assertEqual(publish_anthology(client, host, ["甲", "乙"]).status_code, 404)
+        self.assertIsNone(host_state(client, host)["anthology_url"])
+        # 留存成员可正常发布，编号按原名单顺序
+        for n in ["甲", "丙", "丁"]:
+            set_consent(client, toks[n], True)
+        resp = publish_anthology(client, host, ["丁", "甲", "丙"])
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        pub = resp.get_json()["url"].rsplit("/", 1)[-1]
+        self.assertEqual(
+            [it["manuscript"] for it in client.get(f"/api/a/{pub}").get_json()["items"]],
+            ["稿甲", "稿丙", "稿丁"],
+        )
+
+    def test_close_interaction(self):
+        # 先发布合辑再封存：合辑公开页仍可只读，授权变更与再发布 409
+        for n in self.names:
+            set_consent(self.client, self.tokens[n], True)
+        resp = publish_anthology(self.client, self.host_token, ["甲", "乙"])
+        self.assertEqual(resp.status_code, 200)
+        pub = resp.get_json()["url"].rsplit("/", 1)[-1]
+        self.assertEqual(close_session(self.client, self.host_token).status_code, 200)
+        resp = self.client.get(f"/api/a/{pub}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.get_json()["items"]), 2)
+        self.assertEqual(set_consent(self.client, self.tokens["甲"], False).status_code, 409)
+        self.assertEqual(
+            publish_anthology(self.client, self.host_token, ["甲"]).status_code, 409
+        )
+        # 封存后主持状态仍可见公开链接（只读）
+        hs = host_state(self.client, self.host_token)
+        self.assertTrue(hs["closed"])
+        self.assertEqual(hs["anthology_url"], f"/a/{pub}")
+
+        # 先封存（未发合辑）：授权与发布均 409
+        client2 = new_client()
+        host2, toks2 = create_session(client2)
+        publish_with_reviews(client2, host2, toks2)
+        self.assertEqual(close_session(client2, host2).status_code, 200)
+        self.assertEqual(set_consent(client2, toks2[0], True).status_code, 409)
+        self.assertEqual(publish_anthology(client2, host2, ["甲"]).status_code, 409)
+        self.assertIsNone(host_state(client2, host2)["anthology_url"])
+
+    def test_withdraw_first_then_publish_fails(self):
+        """入选作者先撤回（先提交）：发布在校验时看到撤回，整次 409，不留合辑。"""
+        for n in self.names:
+            set_consent(self.client, self.tokens[n], True)
+        withdraw_entered = threading.Event()
+        release_withdraw = threading.Event()
+        publish_begin = threading.Event()
+        tls = threading.local()
+        armed = {"withdraw": True}
+
+        def hook(_wrapper, sql):
+            if armed["withdraw"] and sql.lstrip().upper().startswith(
+                "UPDATE PARTICIPANTS SET ANTHOLOGY_CONSENT"
+            ):
+                armed["withdraw"] = False
+                withdraw_entered.set()
+                self.assertTrue(release_withdraw.wait(10), "撤回未被释放")
+
+        def pre_hook(_wrapper, sql):
+            if getattr(tls, "publisher", False) and sql.lstrip().upper().startswith(
+                "BEGIN IMMEDIATE"
+            ):
+                publish_begin.set()
+
+        result = {}
+
+        def withdrawer():
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["withdraw"] = set_consent(
+                    new_client(), self.tokens["甲"], False
+                ).status_code
+
+        w = threading.Thread(target=withdrawer)
+        w.start()
+        self.assertTrue(withdraw_entered.wait(10), "撤回未进入更新阶段")
+
+        def publisher():
+            tls.publisher = True
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["publish"] = publish_anthology(
+                    new_client(), self.host_token, ["甲", "乙", "丙"]
+                ).status_code
+
+        t = threading.Thread(target=publisher)
+        t.start()
+        self.assertTrue(publish_begin.wait(10), "发布未发起写事务")
+        time.sleep(0.2)
+        self.assertNotIn("publish", result, "发布不应在撤回提交前完成")
+        release_withdraw.set()
+        w.join(10)
+        t.join(10)
+        self.assertFalse(w.is_alive() or t.is_alive())
+        self.assertEqual(result["withdraw"], 200)
+        self.assertEqual(result["publish"], 409)
+        # 不留合辑：甲已撤回，乙、丙授权不变
+        self.assertIsNone(host_state(self.client, self.host_token)["anthology_url"])
+        self.assertEqual(self.consents(), [False, True, True])
+
+    def test_publish_first_then_consent_frozen_and_repeat_409(self):
+        """发布先提交：后排队的授权变更看到合辑已存在而 409（全部授权冻结），重复发布 409。"""
+        for n in self.names:
+            set_consent(self.client, self.tokens[n], True)
+        publish_entered = threading.Event()
+        release_publish = threading.Event()
+        consent_begin = threading.Event()
+        tls = threading.local()
+        armed = {"publish": True}
+
+        def hook(_wrapper, sql):
+            if armed["publish"] and sql.lstrip().upper().startswith(
+                "INSERT INTO ANTHOLOGIES"
+            ):
+                armed["publish"] = False
+                publish_entered.set()
+                self.assertTrue(release_publish.wait(10), "发布未被释放")
+
+        def pre_hook(_wrapper, sql):
+            if getattr(tls, "consenter", False) and sql.lstrip().upper().startswith(
+                "BEGIN IMMEDIATE"
+            ):
+                consent_begin.set()
+
+        result = {}
+
+        def publisher():
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["publish"] = publish_anthology(
+                    new_client(), self.host_token, ["甲", "乙", "丙"]
+                ).status_code
+
+        t = threading.Thread(target=publisher)
+        t.start()
+        self.assertTrue(publish_entered.wait(10), "发布未进入写入阶段")
+
+        def consenter():
+            tls.consenter = True
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["consent"] = set_consent(
+                    new_client(), self.tokens["甲"], False
+                ).status_code
+
+        w = threading.Thread(target=consenter)
+        w.start()
+        self.assertTrue(consent_begin.wait(10), "授权变更未发起写事务")
+        time.sleep(0.2)
+        self.assertNotIn("consent", result, "授权变更不应在发布提交前完成")
+        release_publish.set()
+        t.join(10)
+        w.join(10)
+        self.assertFalse(t.is_alive() or w.is_alive())
+        self.assertEqual(result["publish"], 200)
+        self.assertEqual(result["consent"], 409)
+        # 授权冻结：甲仍保持已授权；重复发布 409
+        self.assertEqual(self.consents(), [True, True, True])
+        self.assertEqual(
+            publish_anthology(self.client, self.host_token, ["甲"]).status_code, 409
+        )
+
+    def test_persistence_across_restart(self):
+        set_consent(self.client, self.tokens["甲"], True)
+        set_consent(self.client, self.tokens["丙"], True)
+        resp = publish_anthology(self.client, self.host_token, ["丙", "甲"])
+        self.assertEqual(resp.status_code, 200)
+        url = resp.get_json()["url"]
+        pub = url.rsplit("/", 1)[-1]
+        # 模拟重启：init_db 幂等，合辑、授权与公开链接随原库保留
+        app_module.init_db()
+        self.assertEqual(
+            self.client.get(f"/api/a/{pub}").get_json()["items"],
+            [
+                {"number": 1, "manuscript": "稿甲"},
+                {"number": 2, "manuscript": "稿丙"},
+            ],
+        )
+        self.assertEqual(host_state(self.client, self.host_token)["anthology_url"], url)
+        self.assertEqual(self.consents(), [True, False, True])
+        # 冻结状态保留：变更与重复发布仍 409
+        self.assertEqual(set_consent(self.client, self.tokens["乙"], True).status_code, 409)
+        self.assertEqual(
+            publish_anthology(self.client, self.host_token, ["乙"]).status_code, 409
+        )
+
+
 class OldSchemaMigrationTest(unittest.TestCase):
     """旧库启动时自动支持问答、换发、移除、回执、举报与封存存储：补表/补列/回填凭据，旧数据保留。"""
 
@@ -2562,6 +3002,72 @@ class OldSchemaMigrationTest(unittest.TestCase):
             self.assertTrue(client.get("/api/p/tk").get_json()["closed"])
             self.assertEqual(ack(client, "tk").status_code, 409)
             self.assertEqual(close_session(client, "ht").status_code, 409)
+        finally:
+            app_module.DB_PATH = original
+
+    def test_old_db_anthology_auto_supported(self):
+        """旧库启动时自动补建合辑表与授权列：既有成员默认未授权，可授权/发布，重启保留。"""
+        tmp_dir = tempfile.mkdtemp(prefix="review-olddb-anthology-")
+        old_path = os.path.join(tmp_dir, "old.db")
+        conn = sqlite3.connect(old_path)
+        conn.executescript(self.OLD_SCHEMA)
+        conn.execute("INSERT INTO sessions (id, host_token, published) VALUES (1,'ht',1)")
+        conn.execute(
+            "INSERT INTO participants (id, session_id, token, name, position, manuscript, version)"
+            " VALUES (1,1,'tk','旧库作者',0,'旧稿',1)"
+        )
+        conn.execute(
+            "INSERT INTO reviews (id, session_id, reviewer_id, target_id, target_version, content, valid)"
+            " VALUES (1,1,1,1,1,'旧意见',1)"
+        )
+        conn.commit()
+        conn.close()
+
+        original = app_module.DB_PATH
+        app_module.DB_PATH = old_path
+        try:
+            app_module.init_db()
+            c = sqlite3.connect(old_path)
+            try:
+                tables = {
+                    r[0]
+                    for r in c.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                cols = {r[1] for r in c.execute("PRAGMA table_info(participants)")}
+                consent_values = {
+                    r[0] for r in c.execute("SELECT anthology_consent FROM participants")
+                }
+            finally:
+                c.close()
+            self.assertIn("anthologies", tables)
+            self.assertIn("anthology_items", tables)
+            self.assertIn("anthology_consent", cols)
+            self.assertEqual(consent_values, {0})  # 既有成员一律默认未授权
+
+            client = new_client()
+            # 旧库上直接授权/发布：参与状态（本人）与主持状态（各人）同快照返回授权
+            self.assertIs(client.get("/api/p/tk").get_json()["anthology_consent"], False)
+            self.assertEqual(set_consent(client, "tk", True).status_code, 200)
+            resp = publish_anthology(client, "ht", ["旧库作者"])
+            self.assertEqual(resp.status_code, 200, resp.get_json())
+            pub = resp.get_json()["url"].rsplit("/", 1)[-1]
+            self.assertEqual(
+                client.get(f"/api/a/{pub}").get_json(),
+                {"items": [{"number": 1, "manuscript": "旧稿"}]},
+            )
+            # 模拟重启：合辑、授权与公开链接均保留，冻结状态不变
+            app_module.init_db()
+            self.assertEqual(
+                client.get(f"/api/a/{pub}").get_json()["items"][0]["manuscript"], "旧稿"
+            )
+            self.assertIs(client.get("/api/p/tk").get_json()["anthology_consent"], True)
+            self.assertEqual(
+                client.get("/api/h/ht").get_json()["anthology_url"], f"/a/{pub}"
+            )
+            self.assertEqual(set_consent(client, "tk", False).status_code, 409)
+            self.assertEqual(publish_anthology(client, "ht", ["旧库作者"]).status_code, 409)
         finally:
             app_module.DB_PATH = original
 

@@ -49,6 +49,24 @@
       <p id="report-decision-error" class="error"></p>
     </section>
 
+    <section id="anthology-section" class="card" hidden>
+      <h2>匿名合辑</h2>
+      <p class="muted">勾选要收入合辑的稿件（仅已授权的稿件才能发布成功；任一入选稿未授权则整次发布失败）。发布后生成独立的随机公开链接：公开页只按编号展示稿文（编号按原名单顺序），不含姓名、意见、问答等任何其他信息。发布为一次性操作：发布后授权冻结，不能重复发布；会话封存后合辑公开页仍可只读访问。</p>
+      <div id="anthology-form">
+        <table>
+          <thead><tr><th>入选</th><th>姓名</th><th>授权状态</th></tr></thead>
+          <tbody id="anthology-members"></tbody>
+        </table>
+        <div class="row-actions">
+          <button id="anthology-publish" class="primary" type="button">发布匿名合辑</button>
+        </div>
+      </div>
+      <div id="anthology-done" hidden>
+        <p>合辑已发布。公开链接（任何人可读，只含编号与稿文）：<a id="anthology-link" href="#" target="_blank" rel="noopener"></a></p>
+      </div>
+      <p id="anthology-error" class="error"></p>
+    </section>
+
     <section class="card">
       <h2>个人链接（分发给对应的人）</h2>
       <table>

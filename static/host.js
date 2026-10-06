@@ -64,6 +64,7 @@ function render(s) {
   }
 
   renderReports(s.published ? (s.reports || []) : []);
+  renderAnthology(s);
 
   const linksBody = document.getElementById("links");
   linksBody.innerHTML = "";
@@ -147,6 +148,88 @@ function renderReports(reports) {
     tbody.appendChild(tr);
   }
 }
+
+// 匿名合辑：公布后显示各人授权，勾选姓名发布一次；发布后只显示公开链接
+function renderAnthology(s) {
+  const section = document.getElementById("anthology-section");
+  section.hidden = !s.published;
+  if (!s.published) return;
+  const form = document.getElementById("anthology-form");
+  const done = document.getElementById("anthology-done");
+  if (s.anthology_url) {
+    // 已发布：只展示公开链接（封存后仍可只读访问），不再显示选择表单
+    form.hidden = true;
+    done.hidden = false;
+    const a = document.getElementById("anthology-link");
+    a.href = location.origin + s.anthology_url;
+    a.textContent = location.origin + s.anthology_url;
+    return;
+  }
+  form.hidden = false;
+  done.hidden = true;
+  const tbody = document.getElementById("anthology-members");
+  tbody.innerHTML = "";
+  for (const r of s.reviewers) {
+    const tr = document.createElement("tr");
+    const tdPick = document.createElement("td");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = r.name;
+    cb.disabled = !!s.closed;
+    tdPick.appendChild(cb);
+    const tdName = document.createElement("td");
+    tdName.textContent = r.name;
+    const tdConsent = document.createElement("td");
+    tdConsent.textContent = r.anthology_consent ? "已授权" : "未授权";
+    tdConsent.className = r.anthology_consent ? "ok" : "pending";
+    tr.append(tdPick, tdName, tdConsent);
+    tbody.appendChild(tr);
+  }
+  document.getElementById("anthology-publish").disabled = !!s.closed;
+}
+
+// 发布匿名合辑：按勾选的姓名一次发布；任一入选稿未授权则整次失败
+document.getElementById("anthology-publish").addEventListener("click", async () => {
+  const errorEl = document.getElementById("anthology-error");
+  errorEl.textContent = "";
+  const names = [
+    ...document.querySelectorAll("#anthology-members input[type=checkbox]:checked"),
+  ].map((cb) => cb.value);
+  if (!names.length) {
+    errorEl.textContent = "请至少选择一名成员。";
+    return;
+  }
+  if (
+    !confirm(
+      "确定发布匿名合辑？\n" +
+        "发布为一次性操作：入选稿件按原名单顺序编号固化，公开页只显示编号与稿文；\n" +
+        "发布后授权冻结，不能重复发布。"
+    )
+  )
+    return;
+  const btn = document.getElementById("anthology-publish");
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/h/" + token + "/anthology", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ names }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      errorEl.textContent =
+        (data.error || "发布失败") +
+        (data.missing_consent ? "（未授权：" + data.missing_consent.join("、") + "）" : "");
+      btn.disabled = false;
+      return;
+    }
+  } catch {
+    errorEl.textContent = "网络错误，请重试";
+    btn.disabled = false;
+    return;
+  }
+  refresh();
+});
 
 publishBtn.addEventListener("click", async () => {
   if (!confirm("确定公布？公布后稿件与意见均不可再修改。")) return;

@@ -36,6 +36,13 @@
 - 参与状态随快照返回不暴露作者身份的分配凭据；提交意见同时校验凭据与稿件版本，
   分配改变后缺少凭据或沿用旧凭据一律 409（即使两篇稿件版本号相同）；分配从未变过时
   兼容不带凭据的旧提交格式。移除、意见提交与公布在写事务内按提交顺序串行生效。
+- 已公布会话可发布一次匿名合辑：参与者凭个人链接授权或撤回本人稿件（初始未授权，
+  换发链接不改变授权）；主持台显示各人授权，按姓名选择非空、无重复的留存名单发布。
+  仅已公布且未封存时可授权/撤回/发布，否则 409；无效链接或成员 404，非法名单 400；
+  任一入选稿未授权则整次发布 409、不留合辑。授权变更与发布在写事务内按提交顺序生效：
+  入选作者先撤回则发布失败；发布先提交则全部授权冻结，变更及重复发布 409。成功生成
+  独立随机公开链接，入选稿文固化、按原名单顺序编号；公开只读页及响应只含编号与稿文
+  （不含姓名、私密链接、意见、问答或授权记录），无效公开链接 404；封存后合辑仍可只读。
 - 所有写操作在 BEGIN IMMEDIATE 事务内"先检查后变更"，拒绝即整体回滚，不留部分变更。
 - 状态读取（参与页、主持台）在单个只读事务内完成：整个响应取自同一快照；
   WAL 下读取不阻塞其他连接的写入，写入也不阻塞读取。
@@ -79,6 +86,9 @@ CREATE TABLE IF NOT EXISTS participants (
     active INTEGER NOT NULL DEFAULT 1,
     assignment_nonce TEXT NOT NULL DEFAULT '',
     assignment_gen INTEGER NOT NULL DEFAULT 0,
+    -- 匿名合辑授权：本人是否授权稿件收入合辑；初始未授权（0），换发链接不改变，
+    -- 合辑发布后全部冻结
+    anthology_consent INTEGER NOT NULL DEFAULT 0,
     UNIQUE (session_id, position)
 );
 CREATE TABLE IF NOT EXISTS reviews (
@@ -126,6 +136,22 @@ CREATE TABLE IF NOT EXISTS token_history (
     participant_id INTEGER NOT NULL REFERENCES participants(id),
     token TEXT NOT NULL UNIQUE
 );
+-- 匿名合辑：已公布会话由主持人按授权名单发布一次（session_id 唯一）；公开链接独立随机
+CREATE TABLE IF NOT EXISTS anthologies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL UNIQUE REFERENCES sessions(id),
+    public_token TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+-- 合辑条目：入选稿文发布时复制固化，按原名单（录入）顺序从 1 编号；
+-- 只存编号与稿文，不含姓名、私密链接、意见、问答或授权记录
+CREATE TABLE IF NOT EXISTS anthology_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    anthology_id INTEGER NOT NULL REFERENCES anthologies(id),
+    number INTEGER NOT NULL,
+    manuscript TEXT NOT NULL,
+    UNIQUE (anthology_id, number)
+);
 """
 
 app = Flask(__name__)
@@ -134,14 +160,16 @@ app = Flask(__name__)
 def init_db():
     """建库建表（幂等），数据落盘在 DB_PATH，重启后保留。
 
-    旧版数据库（无 clarifications / token_history / receipts / reports 表，或
-    participants 缺 active / assignment_nonce / assignment_gen 列，或 sessions 缺
-    closed 列）启动时自动补建问答表、历史链接表、回执表、举报表与移除成员所需列，
+    旧版数据库（无 clarifications / token_history / receipts / reports /
+    anthologies / anthology_items 表，或 participants 缺 active / assignment_nonce /
+    assignment_gen / anthology_consent 列，或 sessions 缺 closed 列）启动时自动补建
+    问答表、历史链接表、回执表、举报表、合辑表与移除成员所需列，
     既有 sessions/participants/reviews 数据原样保留；
     补列时为每位既有成员回填一个分配凭据（视为其当前分配从未变过，gen=0），
     sessions.closed 补列默认 0——既有会话一律视为未封存，封存状态随原数据卷重启保留；
-    旧库因此自动支持移除成员、已读回执、意见举报与会话封存（既有意见初始为未举报），
-    无需手动迁移。
+    participants.anthology_consent 补列默认 0——既有成员一律视为未授权合辑；
+    旧库因此自动支持移除成员、已读回执、意见举报、会话封存与匿名合辑
+    （既有意见初始为未举报，既有成员初始未授权），无需手动迁移。
     """
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -162,6 +190,9 @@ def init_db():
         conn.execute("ALTER TABLE participants ADD COLUMN assignment_nonce TEXT NOT NULL DEFAULT ''")
     if "assignment_gen" not in cols:
         conn.execute("ALTER TABLE participants ADD COLUMN assignment_gen INTEGER NOT NULL DEFAULT 0")
+    if "anthology_consent" not in cols:
+        # 旧库既有成员一律视为未授权合辑（初始未授权）
+        conn.execute("ALTER TABLE participants ADD COLUMN anthology_consent INTEGER NOT NULL DEFAULT 0")
     # 旧库既有成员：回填一个分配凭据，标记为"分配从未变过"（gen=0，兼容旧提交格式）
     rows = conn.execute(
         "SELECT id FROM participants WHERE assignment_nonce=''"
@@ -295,6 +326,24 @@ def new_assignment_nonce(conn):
             return nonce
 
 
+def find_anthology(conn, session_id):
+    """本会话的匿名合辑（至多一份；未发布为 None）。"""
+    return conn.execute(
+        "SELECT * FROM anthologies WHERE session_id=?", (session_id,)
+    ).fetchone()
+
+
+def new_anthology_token(conn):
+    """生成不与任何已发合辑冲突的独立随机公开链接 token。"""
+    while True:
+        token = secrets.token_urlsafe(24)
+        exists = conn.execute(
+            "SELECT 1 FROM anthologies WHERE public_token=? LIMIT 1", (token,)
+        ).fetchone()
+        if exists is None:
+            return token
+
+
 def find_review_by_reviewer(conn, session_id, reviewer_id):
     return conn.execute(
         "SELECT * FROM reviews WHERE session_id=? AND reviewer_id=?",
@@ -405,6 +454,11 @@ def participant_page(token):
     return send_from_directory(app.static_folder, "participant.html")
 
 
+@app.get("/a/<token>")
+def anthology_page(token):
+    return send_from_directory(app.static_folder, "anthology.html")
+
+
 # ---------------- 创建会话 ----------------
 
 @app.post("/api/sessions")
@@ -492,6 +546,8 @@ def host_status(host_token):
                     "submitted": submitted,
                     "acknowledged": view["acknowledged"],
                     "acknowledged_at": view["acknowledged_at"],
+                    # 匿名合辑授权：主持台按留存名单原顺序显示各人授权（同一快照）
+                    "anthology_consent": bool(p["anthology_consent"]),
                 }
             )
         report_rows = conn.execute(
@@ -500,6 +556,7 @@ def host_status(host_token):
             " WHERE rp.session_id=? ORDER BY rp.id",
             (session["id"],),
         ).fetchall()
+        anthology = find_anthology(conn, session["id"])
         conn.commit()
         return jsonify(
             {
@@ -508,6 +565,10 @@ def host_status(host_token):
                 "can_publish": can_publish,
                 "reviewers": reviewers,
                 "reports": [host_report_view(r) for r in report_rows],
+                # 合辑公开链接：未发布为 None；公开链接本身可公开，不含任何私密信息
+                "anthology_url": (
+                    f"/a/{anthology['public_token']}" if anthology is not None else None
+                ),
                 "links": [
                     {"name": p["name"], "url": f"/p/{p['token']}"} for p in parts
                 ],
@@ -801,6 +862,9 @@ def participant_state(token):
             "published": published,
             # 封存：与 published 等字段同一快照返回；true 时页面只读、一切写请求 409
             "closed": closed,
+            # 匿名合辑授权：只返回本人授权状态（初始未授权），与上述字段同一快照；
+            # 他人授权、合辑名单与公开链接不在此返回
+            "anthology_consent": bool(me["anthology_consent"]),
             # 匿名：不返回被评稿件作者的姓名；credential 是不暴露作者身份的分配凭据，
             # 提交意见时与稿件版本一并校验
             "assignment": {
@@ -1212,6 +1276,172 @@ def decide_report(host_token, report_id, decision):
             return err("该举报已经处理，不能重复处理或修改", 409)
         conn.commit()
         return jsonify({"ok": True, "id": report_id, "status": new_status})
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# ---------------- 匿名合辑 ----------------
+
+
+@app.post("/api/p/<token>/anthology-consent")
+def set_anthology_consent(token):
+    """参与者授权或撤回本人稿件收入匿名合辑：公布后开放，初始未授权。
+
+    服务端凭个人链接确定本人，请求体 {"consent": true|false}；授权绑定参与者身份，
+    换发链接不改变。仅已公布且未封存时可变更，否则 409；合辑一旦发布，全部授权冻结，
+    之后的变更一律 409。无效（含已退出、已换发作废的）个人链接 404；请求格式不对 400。
+    授权变更与合辑发布在同一写事务机制内按提交顺序串行生效。
+    """
+    data = request.get_json(silent=True) or {}
+    consent = data.get("consent")
+    if not isinstance(consent, bool):
+        return err("请明确授权（consent 为 true）或撤回（consent 为 false）")
+
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        me = find_participant(conn, token)
+        if me is None:
+            conn.rollback()
+            return err("个人链接无效", 404)
+        session = conn.execute(
+            "SELECT published, closed FROM sessions WHERE id=?", (me["session_id"],)
+        ).fetchone()
+        # 封存后只读：授权变更一律 409，且不改变任何数据
+        if session["closed"]:
+            conn.rollback()
+            return err("会话已封存，只读，不能再写入", 409)
+        # 仅已公布会话可授权/撤回：公布前一概 409
+        if not session["published"]:
+            conn.rollback()
+            return err("尚未公布，不能授权或撤回", 409)
+        # 合辑发布后全部授权冻结：发布先提交则此处必能看到，变更一律 409
+        if find_anthology(conn, me["session_id"]) is not None:
+            conn.rollback()
+            return err("合辑已发布，授权已冻结，不能再变更", 409)
+        conn.execute(
+            "UPDATE participants SET anthology_consent=? WHERE id=?",
+            (1 if consent else 0, me["id"]),
+        )
+        conn.commit()
+        return jsonify({"ok": True, "consent": consent})
+    except Exception:
+        conn.rollback()
+        raise
+
+
+@app.post("/api/h/<host_token>/anthology")
+def publish_anthology(host_token):
+    """主持人按姓名选择本会话留存成员，发布一次匿名合辑。
+
+    请求体 {"names": [...]}：非空、无重复，否则 400；仅已公布且未封存时可发布，
+    否则 409；主持链接无效或姓名不属于本会话留存成员 404；任一入选稿未授权则整次
+    发布 409、不留合辑。成功生成独立随机公开链接，入选稿文复制固化并按原名单
+    （录入）顺序从 1 编号。授权变更与发布按提交顺序串行生效：入选作者先撤回则
+    本发布在校验时看到撤回而失败；发布先提交则全部授权冻结，变更及重复发布 409。
+    """
+    data = request.get_json(silent=True) or {}
+    names = data.get("names")
+    if not isinstance(names, list) or not names:
+        return err("请提供非空的入选名单")
+    cleaned = []
+    for n in names:
+        if not isinstance(n, str) or not n.strip():
+            return err("名单中的姓名必须是非空字符串")
+        n = n.strip()
+        if len(n) > MAX_NAME_LEN:
+            return err(f"姓名不超过 {MAX_NAME_LEN} 字")
+        cleaned.append(n)
+    if len(set(cleaned)) != len(cleaned):
+        return err("名单中的姓名不能重复")
+
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        session = find_session_by_host(conn, host_token)
+        if session is None:
+            conn.rollback()
+            return err("主持链接无效", 404)
+        if session["closed"]:
+            conn.rollback()
+            return err("会话已封存，只读，不能再写入", 409)
+        if not session["published"]:
+            conn.rollback()
+            return err("尚未公布，不能发布合辑", 409)
+        # 发布一次：重复发布一律 409（与授权变更按提交顺序串行，彼此可见）
+        if find_anthology(conn, session["id"]) is not None:
+            conn.rollback()
+            return err("已发布过合辑，不能重复发布", 409)
+        selected = []
+        for n in cleaned:
+            p = find_participant_by_name(conn, session["id"], n)
+            # 姓名不属于本会话留存成员（含已移除者）按不存在处理，不透露名单
+            if p is None:
+                conn.rollback()
+                return err("本会话中没有该成员", 404)
+            selected.append(p)
+        # 任一入选稿未授权：整次发布失败，回滚不留合辑，授权状态不变
+        not_consented = [p["name"] for p in selected if not p["anthology_consent"]]
+        if not_consented:
+            conn.rollback()
+            return err(
+                "有入选稿件未获授权，整次发布已取消",
+                409,
+                missing_consent=not_consented,
+            )
+        # 按原名单（录入）顺序编号；稿文复制固化，此后授权与稿件状态如何变化都与合辑无关
+        selected.sort(key=lambda p: p["position"])
+        public_token = new_anthology_token(conn)
+        cur = conn.execute(
+            "INSERT INTO anthologies (session_id, public_token) VALUES (?,?)",
+            (session["id"], public_token),
+        )
+        anthology_id = cur.lastrowid
+        for number, p in enumerate(selected, 1):
+            conn.execute(
+                "INSERT INTO anthology_items (anthology_id, number, manuscript)"
+                " VALUES (?,?,?)",
+                (anthology_id, number, p["manuscript"]),
+            )
+        conn.commit()
+        return jsonify({"ok": True, "url": f"/a/{public_token}"})
+    except Exception:
+        conn.rollback()
+        raise
+
+
+@app.get("/api/a/<public_token>")
+def anthology_public(public_token):
+    """匿名合辑公开只读数据：只含编号与稿文。
+
+    不含姓名、私密链接、意见、问答或授权记录；无效公开链接 404。
+    合辑在发布时固化，会话封存后仍可只读；任何人持公开链接均可读取。
+    """
+    conn = get_db()
+    try:
+        # 只读事务：整个响应取自同一快照；WAL 下不阻塞其他连接的写入
+        conn.execute("BEGIN")
+        anthology = conn.execute(
+            "SELECT * FROM anthologies WHERE public_token=?", (public_token,)
+        ).fetchone()
+        if anthology is None:
+            conn.rollback()
+            return err("公开链接无效", 404)
+        items = conn.execute(
+            "SELECT number, manuscript FROM anthology_items"
+            " WHERE anthology_id=? ORDER BY number",
+            (anthology["id"],),
+        ).fetchall()
+        conn.commit()
+        return jsonify(
+            {
+                "items": [
+                    {"number": r["number"], "manuscript": r["manuscript"]}
+                    for r in items
+                ]
+            }
+        )
     except Exception:
         conn.rollback()
         raise

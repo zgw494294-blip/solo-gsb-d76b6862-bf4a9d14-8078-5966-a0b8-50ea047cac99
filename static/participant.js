@@ -52,6 +52,10 @@ const els = {
   reportId: document.getElementById("report-id"),
   reportReason: document.getElementById("report-reason"),
   reportStatus: document.getElementById("report-status"),
+  anthologySection: document.getElementById("anthology-section"),
+  anthologyStatus: document.getElementById("anthology-status"),
+  anthologyToggle: document.getElementById("anthology-toggle"),
+  anthologyMsg: document.getElementById("anthology-msg"),
 };
 
 let firstLoad = true;
@@ -155,6 +159,7 @@ function render(s) {
   renderReport(s.published ? s.report : null);
   renderQuestion(s.published ? s.received_clarification : null);
   renderAnswer(s.published ? s.my_review_clarification : null);
+  renderAnthology(s);
 
   // 封存：与其他字段同一快照返回；页面整体只读，停用一切写控件（含问答、回执、举报）。
   // 放在子渲染之后，避免其把举报等按钮重新启用。
@@ -164,12 +169,31 @@ function render(s) {
       els.manuscript, els.saveMs, els.review, els.submitReview,
       els.questionInput, els.submitQuestion, els.answerInput, els.submitAnswer,
       els.ackButton, els.reportInput, els.submitReport, els.confirmReread,
+      els.anthologyToggle,
     ]) {
       el.disabled = true;
     }
   }
 
   firstLoad = false;
+}
+
+// 匿名合辑授权：仅公布后可见；只显示与切换本人授权，不展示他人授权或合辑名单
+function renderAnthology(s) {
+  if (!s.published) {
+    els.anthologySection.hidden = true;
+    return;
+  }
+  els.anthologySection.hidden = false;
+  if (s.anthology_consent) {
+    els.anthologyStatus.textContent = "当前状态：已授权。你的稿件可被主持人收入匿名合辑。";
+    els.anthologyStatus.className = "ok";
+    els.anthologyToggle.textContent = "撤回授权";
+  } else {
+    els.anthologyStatus.textContent = "当前状态：未授权。你的稿件不会被收入匿名合辑。";
+    els.anthologyStatus.className = "muted";
+    els.anthologyToggle.textContent = "授权收入合辑";
+  }
 }
 
 // 作者视角：已读回执。确认状态以服务端快照/成功响应为准；打开页面与轮询不会自动确认
@@ -388,6 +412,30 @@ els.ackButton.addEventListener("click", async () => {
     setMsg(els.ackMsg, "网络错误，请重试", true);
   }
   els.ackButton.disabled = false;
+  refresh();
+});
+
+// 匿名合辑授权/撤回：只切换本人授权；合辑已发布或会话封存时服务端返回 409
+els.anthologyToggle.addEventListener("click", async () => {
+  const next = !(lastState && lastState.anthology_consent);
+  els.anthologyToggle.disabled = true;
+  setMsg(els.anthologyMsg, "");
+  try {
+    const r = await fetch("/api/p/" + token + "/anthology-consent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ consent: next }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      setMsg(els.anthologyMsg, data.error || "操作失败，请重试", true);
+    } else {
+      setMsg(els.anthologyMsg, next ? "已授权。" : "已撤回授权。");
+    }
+  } catch {
+    setMsg(els.anthologyMsg, "网络错误，请重试", true);
+  }
+  els.anthologyToggle.disabled = false;
   refresh();
 });
 
