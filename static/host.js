@@ -41,6 +41,8 @@ function render(s) {
   // 已读回执列仅公布后展示（按留存名单原顺序），不含意见或问答内容
   document.getElementById("ack-head").hidden = !s.published;
   document.getElementById("ack-note").hidden = !s.published;
+  // 合辑授权列同样仅公布后展示（授权仅公布后可变更）
+  document.getElementById("consent-head").hidden = !s.published;
 
   const tbody = document.getElementById("reviewers");
   tbody.innerHTML = "";
@@ -59,10 +61,15 @@ function render(s) {
         : "待确认";
       tdAck.className = r.acknowledged ? "ok" : "pending";
       tr.appendChild(tdAck);
+      const tdConsent = document.createElement("td");
+      tdConsent.textContent = r.collection_consent ? "已授权" : "未授权";
+      tdConsent.className = r.collection_consent ? "ok" : "muted";
+      tr.appendChild(tdConsent);
     }
     tbody.appendChild(tr);
   }
 
+  renderCollection(s);
   renderReports(s.published ? (s.reports || []) : []);
 
   const linksBody = document.getElementById("links");
@@ -94,6 +101,42 @@ function render(s) {
     tdAction.append(rotateBtn, removeBtn);
     tr.append(tdName, tdLink, tdAction);
     linksBody.appendChild(tr);
+  }
+}
+
+// 匿名合辑：仅公布后展示；未发布时按姓名勾选（至少一人），已发布则只读展示公开链接
+function renderCollection(s) {
+  const section = document.getElementById("collection-section");
+  section.hidden = !s.published;
+  if (!s.published) return;
+  const picker = document.getElementById("collection-picker");
+  const publishBtn = document.getElementById("publish-collection");
+  const linkLine = document.getElementById("collection-link-line");
+  if (s.collection) {
+    // 已发布：隐藏勾选与发布按钮，只读展示公开链接（封存后仍可读）
+    picker.innerHTML = "";
+    publishBtn.hidden = true;
+    linkLine.hidden = false;
+    const a = document.getElementById("collection-link");
+    a.href = location.origin + s.collection.url;
+    a.textContent = location.origin + s.collection.url;
+    return;
+  }
+  publishBtn.hidden = false;
+  publishBtn.disabled = !!s.closed; // 封存后一切写操作停用
+  linkLine.hidden = true;
+  picker.innerHTML = "";
+  for (const r of s.reviewers) {
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = r.name;
+    box.disabled = !!s.closed;
+    label.appendChild(box);
+    label.append(
+      " " + r.name + (r.collection_consent ? "（已授权）" : "（未授权）")
+    );
+    picker.appendChild(label);
   }
 }
 
@@ -161,6 +204,48 @@ publishBtn.addEventListener("click", async () => {
     }
   } catch {
     errorEl.textContent = "网络错误，请重试";
+  }
+  refresh();
+});
+
+// 发布匿名合辑：按勾选姓名提交；任一入选稿未授权则整次失败，发布为一次性操作
+document.getElementById("publish-collection").addEventListener("click", async () => {
+  const collectionError = document.getElementById("collection-error");
+  collectionError.textContent = "";
+  const names = Array.from(
+    document.querySelectorAll("#collection-picker input[type=checkbox]:checked")
+  ).map((box) => box.value);
+  if (!names.length) {
+    collectionError.textContent = "请至少勾选一名成员。";
+    return;
+  }
+  if (
+    !confirm(
+      "确定发布匿名合辑？\n入选：" + names.join("、") +
+      "\n发布为一次性操作：稿文按原名单顺序编号固化，所有人授权随即冻结，不可再变更。"
+    )
+  )
+    return;
+  const btn = document.getElementById("publish-collection");
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/h/" + token + "/collection", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ names }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      collectionError.textContent =
+        (data.error || "发布失败，请刷新主持台后重试") +
+        (data.unauthorized ? "（未授权：" + data.unauthorized.join("、") + "）" : "");
+      btn.disabled = false;
+      return;
+    }
+  } catch {
+    collectionError.textContent = "网络错误，请重试";
+    btn.disabled = false;
+    return;
   }
   refresh();
 });

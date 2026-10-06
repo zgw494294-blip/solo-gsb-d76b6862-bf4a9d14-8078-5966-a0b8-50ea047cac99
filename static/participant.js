@@ -52,6 +52,10 @@ const els = {
   reportId: document.getElementById("report-id"),
   reportReason: document.getElementById("report-reason"),
   reportStatus: document.getElementById("report-status"),
+  consentSection: document.getElementById("consent-section"),
+  consentState: document.getElementById("consent-state"),
+  consentToggle: document.getElementById("consent-toggle"),
+  consentMsg: document.getElementById("consent-msg"),
 };
 
 let firstLoad = true;
@@ -155,6 +159,7 @@ function render(s) {
   renderReport(s.published ? s.report : null);
   renderQuestion(s.published ? s.received_clarification : null);
   renderAnswer(s.published ? s.my_review_clarification : null);
+  renderConsent(s);
 
   // 封存：与其他字段同一快照返回；页面整体只读，停用一切写控件（含问答、回执、举报）。
   // 放在子渲染之后，避免其把举报等按钮重新启用。
@@ -164,12 +169,29 @@ function render(s) {
       els.manuscript, els.saveMs, els.review, els.submitReview,
       els.questionInput, els.submitQuestion, els.answerInput, els.submitAnswer,
       els.ackButton, els.reportInput, els.submitReport, els.confirmReread,
+      els.consentToggle,
     ]) {
       el.disabled = true;
     }
   }
 
   firstLoad = false;
+}
+
+// 匿名合辑授权：仅公布后展示；状态以服务端快照为准，授权/撤回结果由服务端确认
+function renderConsent(s) {
+  els.consentSection.hidden = !s.published;
+  if (!s.published) return;
+  if (s.collection_consent) {
+    els.consentState.textContent = "当前状态：已授权。你的稿件可被主持人选入匿名合辑。";
+    els.consentState.className = "ok";
+    els.consentToggle.textContent = "撤回授权";
+  } else {
+    els.consentState.textContent = "当前状态：未授权。你的稿件不会被选入匿名合辑。";
+    els.consentState.className = "muted";
+    els.consentToggle.textContent = "授权本人稿件进入合辑";
+  }
+  els.consentToggle.disabled = !!s.closed;
 }
 
 // 作者视角：已读回执。确认状态以服务端快照/成功响应为准；打开页面与轮询不会自动确认
@@ -389,6 +411,29 @@ els.ackButton.addEventListener("click", async () => {
   }
   els.ackButton.disabled = false;
   refresh();
+});
+
+// 授权/撤回本人稿件进入匿名合辑：目标状态取当前快照的反面，以服务端响应为准
+els.consentToggle.addEventListener("click", async () => {
+  const next = !(lastState && lastState.collection_consent);
+  els.consentToggle.disabled = true;
+  setMsg(els.consentMsg, "");
+  try {
+    const r = await fetch("/api/p/" + token + "/collection-consent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ consent: next }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      setMsg(els.consentMsg, data.error || "操作失败，请重试", true);
+    } else {
+      setMsg(els.consentMsg, data.consent ? "已授权。" : "已撤回授权。");
+    }
+  } catch {
+    setMsg(els.consentMsg, "网络错误，请重试", true);
+  }
+  refresh(); // 以最新快照恢复按钮状态（含合辑已发布导致授权冻结的 409）
 });
 
 refresh();

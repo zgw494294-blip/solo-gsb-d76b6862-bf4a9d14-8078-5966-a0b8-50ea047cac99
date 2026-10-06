@@ -28,7 +28,7 @@
       <h2>互评进度</h2>
       <p id="pending-summary" class="muted"></p>
       <table>
-        <thead><tr><th>姓名</th><th>互评意见状态</th><th id="ack-head" hidden>已读回执</th></tr></thead>
+        <thead><tr><th>姓名</th><th>互评意见状态</th><th id="ack-head" hidden>已读回执</th><th id="consent-head" hidden>合辑授权</th></tr></thead>
         <tbody id="reviewers"></tbody>
       </table>
       <p class="muted" id="ack-note" hidden>已读回执按留存名单原顺序显示：作者在其页面明确确认已读后记为"已确认"并给出首次确认时间；此处不展示意见或问答内容。</p>
@@ -37,6 +37,17 @@
       </div>
       <p class="muted">只有每篇当前稿件都有有效意见时才能公布；公布为一次性操作，公布后稿件与意见均不可再改。</p>
       <p id="error" class="error"></p>
+    </section>
+
+    <section id="collection-section" class="card" hidden>
+      <h2>匿名合辑</h2>
+      <p class="muted">按姓名勾选要收入合辑的留存成员（至少一人、不可重复）。仅当所有入选者都已授权时才能发布；发布为一次性操作：成功后生成独立随机公开链接，入选稿文按原名单顺序编号固化，公开页只含编号与稿文（不含姓名、意见、问答或授权记录）。发布后所有人授权冻结，不能再变更。</p>
+      <div id="collection-picker"></div>
+      <div class="row-actions">
+        <button id="publish-collection" class="primary" type="button">发布匿名合辑</button>
+      </div>
+      <p id="collection-error" class="error"></p>
+      <p id="collection-link-line" hidden>公开链接（可转发给任何人只读查阅，封存后仍可读）：<a id="collection-link" href="#" target="_blank" rel="noopener"></a></p>
     </section>
 
     <section id="reports-section" class="card" hidden>

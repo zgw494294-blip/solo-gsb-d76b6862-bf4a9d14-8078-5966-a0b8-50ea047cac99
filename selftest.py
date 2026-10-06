@@ -2281,8 +2281,431 @@ class CloseSessionTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
 
 
+class CollectionTest(unittest.TestCase):
+    """匿名合辑：授权/撤回、发布门槛与名单校验、公开只读、冻结、提交顺序、持久化。"""
+
+    def setUp(self):
+        self.client = new_client()
+        self.host_token, self.tokens = create_session(self.client)
+        self.t_jia, self.t_yi, self.t_bing = self.tokens
+
+    def consent(self, client, token, value):
+        return client.post(
+            f"/api/p/{token}/collection-consent", json={"consent": value}
+        )
+
+    def publish_collection(self, client, host_token, names):
+        return client.post(f"/api/h/{host_token}/collection", json={"names": names})
+
+    def published(self):
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+
+    def collections_count(self):
+        """本会话（甲所在会话）的合辑数。"""
+        conn = sqlite3.connect(app_module.DB_PATH)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM collections WHERE session_id="
+                " (SELECT session_id FROM participants WHERE token=?)",
+                (self.t_jia,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_pre_publish_409_and_status_fields_present(self):
+        # 公布前：授权与发布均 409；参与/主持状态仍带授权字段（初始未授权）
+        self.assertEqual(self.consent(self.client, self.t_jia, True).status_code, 409)
+        self.assertEqual(
+            self.publish_collection(self.client, self.host_token, ["甲"]).status_code,
+            409,
+        )
+        self.assertFalse(state(self.client, self.t_jia)["collection_consent"])
+        hs = host_state(self.client, self.host_token)
+        self.assertEqual(
+            [r["collection_consent"] for r in hs["reviewers"]], [False] * 3
+        )
+        self.assertIsNone(hs["collection"])
+        self.assertEqual(self.collections_count(), 0)
+
+    def test_validation_400_and_not_found_404(self):
+        self.published()
+        # 授权请求体非法 → 400（consent 必须是布尔值）
+        for payload in [{}, {"consent": "true"}, {"consent": 1}, {"consent": None}]:
+            self.assertEqual(
+                self.client.post(
+                    f"/api/p/{self.t_jia}/collection-consent", json=payload
+                ).status_code,
+                400,
+                payload,
+            )
+        # 名单非法 → 400：缺名单、空名单、非列表、重复姓名、非字符串、空白、超长
+        for payload in [
+            {},
+            {"names": []},
+            {"names": "甲"},
+            {"names": ["甲", "甲"]},
+            {"names": ["甲", 1]},
+            {"names": ["  "]},
+            {"names": ["x" * (app_module.MAX_NAME_LEN + 1)]},
+        ]:
+            self.assertEqual(
+                self.client.post(
+                    f"/api/h/{self.host_token}/collection", json=payload
+                ).status_code,
+                400,
+                payload,
+            )
+        # 未知成员 → 404；无效主持链接 → 404；无效个人链接 → 404；无效公开链接 → 404
+        self.assertEqual(
+            self.publish_collection(self.client, self.host_token, ["甲", "某人"]).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.publish_collection(self.client, "假主持", ["甲"]).status_code, 404
+        )
+        self.assertEqual(self.consent(self.client, "假链接", True).status_code, 404)
+        self.assertEqual(self.client.get("/api/c/不存在的公开链接").status_code, 404)
+        # 全部失败不留合辑、授权不变
+        self.assertEqual(self.collections_count(), 0)
+        self.assertFalse(state(self.client, self.t_jia)["collection_consent"])
+
+    def test_consent_set_unset_repeat_and_visibility(self):
+        self.published()
+        self.assertEqual(self.consent(self.client, self.t_jia, True).status_code, 200)
+        self.assertTrue(state(self.client, self.t_jia)["collection_consent"])
+        # 发布前重复设置为同一状态仍成功（变更不受限）
+        self.assertEqual(self.consent(self.client, self.t_jia, True).status_code, 200)
+        resp = self.consent(self.client, self.t_jia, False)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {"ok": True, "consent": False})
+        self.assertFalse(state(self.client, self.t_jia)["collection_consent"])
+
+        # 主持台按留存名单原顺序显示各人授权
+        self.consent(self.client, self.t_jia, True)
+        self.consent(self.client, self.t_bing, True)
+        reviewers = host_state(self.client, self.host_token)["reviewers"]
+        self.assertEqual([r["name"] for r in reviewers], ["甲", "乙", "丙"])
+        self.assertEqual(
+            [r["collection_consent"] for r in reviewers], [True, False, True]
+        )
+        # 参与状态只返回本人授权：乙的响应里只有自己（未授权），无他人授权记录
+        self.assertFalse(state(self.client, self.t_yi)["collection_consent"])
+        body = self.client.get(f"/api/p/{self.t_yi}").get_data(as_text=True)
+        self.assertEqual(body.count("collection_consent"), 1)
+
+    def test_unauthorized_selection_aborts_whole_publish(self):
+        self.published()
+        self.consent(self.client, self.t_jia, True)
+        self.consent(self.client, self.t_bing, True)
+        # 乙未授权：整次 409，响应列出未授权者，不留合辑
+        resp = self.publish_collection(self.client, self.host_token, ["甲", "乙", "丙"])
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json()["unauthorized"], ["乙"])
+        self.assertEqual(self.collections_count(), 0)
+        self.assertIsNone(host_state(self.client, self.host_token)["collection"])
+        # 乙补授权后同一名单发布成功
+        self.consent(self.client, self.t_yi, True)
+        resp = self.publish_collection(self.client, self.host_token, ["甲", "乙", "丙"])
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(self.collections_count(), 1)
+
+    def test_public_response_only_numbers_and_texts_in_roster_order(self):
+        self.published()
+        for tok in self.tokens:
+            self.consent(self.client, tok, True)
+        # 请求名单顺序打乱：编号仍按原名单（录入）顺序
+        resp = self.publish_collection(self.client, self.host_token, ["丙", "甲", "乙"])
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        url = resp.get_json()["url"]
+        self.assertTrue(url.startswith("/c/"))
+
+        pub = self.client.get(f"/api{url}")
+        self.assertEqual(pub.status_code, 200)
+        data = pub.get_json()
+        self.assertEqual(set(data.keys()), {"items"})
+        self.assertEqual(
+            data["items"],
+            [
+                {"number": 1, "manuscript": "文本一"},
+                {"number": 2, "manuscript": "文本二"},
+                {"number": 3, "manuscript": "文本三"},
+            ],
+        )
+        body = pub.get_data(as_text=True)
+        # 不含姓名、私密链接、意见、问答或授权记录
+        for leaked in [
+            "甲", "乙", "丙",
+            "甲评乙", "乙评丙", "丙评甲",
+            "consent", "token", "/p/", "/h/",
+        ]:
+            self.assertNotIn(leaked, body)
+        # 公开只读页面可访问；主持状态给出同一公开链接
+        self.assertEqual(self.client.get(url).status_code, 200)
+        self.assertEqual(
+            host_state(self.client, self.host_token)["collection"], {"url": url}
+        )
+        # 参与状态不含公开链接（只含本人授权）
+        self.assertNotIn("collection", state(self.client, self.t_jia))
+
+    def test_publish_freezes_consents_and_repeat_publish_409(self):
+        self.published()
+        self.consent(self.client, self.t_jia, True)
+        self.consent(self.client, self.t_yi, True)
+        resp = self.publish_collection(self.client, self.host_token, ["甲", "乙"])
+        self.assertEqual(resp.status_code, 200)
+        # 重复发布（无论名单是否相同）一律 409
+        self.assertEqual(
+            self.publish_collection(self.client, self.host_token, ["甲", "乙"]).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.publish_collection(self.client, self.host_token, ["甲"]).status_code, 409
+        )
+        # 全部授权冻结：入选者撤回/重复授权、未入选者授权均 409
+        self.assertEqual(self.consent(self.client, self.t_jia, False).status_code, 409)
+        self.assertEqual(self.consent(self.client, self.t_jia, True).status_code, 409)
+        self.assertEqual(self.consent(self.client, self.t_bing, True).status_code, 409)
+        # 状态不变，合辑只有一个
+        self.assertTrue(state(self.client, self.t_jia)["collection_consent"])
+        self.assertFalse(state(self.client, self.t_bing)["collection_consent"])
+        self.assertEqual(self.collections_count(), 1)
+
+    def test_removed_member_in_list_404(self):
+        host, tokens = create_named_session(new_client(), ["甲", "乙", "丙", "丁"])
+        client = new_client()
+        self.assertEqual(remove_member(client, host, "丁").status_code, 200)
+        # 环闭合后丙改评甲：持新凭据提交，三人意见齐备后公布
+        cred = state(client, tokens["丙"])["assignment"]["credential"]
+        self.assertEqual(submit_review(client, tokens["甲"], "甲评乙", 1).status_code, 200)
+        self.assertEqual(submit_review(client, tokens["乙"], "乙评丙", 1).status_code, 200)
+        self.assertEqual(
+            submit_review(client, tokens["丙"], "丙评甲", 1, credential=cred).status_code,
+            200,
+        )
+        self.assertEqual(client.post(f"/api/h/{host}/publish").status_code, 200)
+        # 已移除者不是留存成员：入选名单含丁 → 404，不留合辑
+        resp = client.post(f"/api/h/{host}/collection", json={"names": ["甲", "丁"]})
+        self.assertEqual(resp.status_code, 404)
+        hs = client.get(f"/api/h/{host}").get_json()
+        self.assertIsNone(hs["collection"])
+        # 留存成员（甲、乙、丙）可正常授权与发布
+        for n in ["甲", "乙", "丙"]:
+            self.assertEqual(self.consent(client, tokens[n], True).status_code, 200)
+        resp = client.post(
+            f"/api/h/{host}/collection", json={"names": ["丙", "甲", "乙"]}
+        )
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        data = client.get("/api" + resp.get_json()["url"]).get_json()
+        self.assertEqual(
+            data["items"],
+            [
+                {"number": 1, "manuscript": "稿甲"},
+                {"number": 2, "manuscript": "稿乙"},
+                {"number": 3, "manuscript": "稿丙"},
+            ],
+        )
+
+    def test_rotate_link_preserves_consent(self):
+        self.published()
+        self.assertEqual(self.consent(self.client, self.t_jia, True).status_code, 200)
+        resp = self.client.post(
+            f"/api/h/{self.host_token}/rotate-link",
+            json={"name": "甲", "link": f"/p/{self.t_jia}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        new_jia = resp.get_json()["url"].rsplit("/", 1)[-1]
+        # 授权随原身份保留；旧链接变更授权 404
+        self.assertTrue(state(self.client, new_jia)["collection_consent"])
+        self.assertEqual(self.consent(self.client, self.t_jia, False).status_code, 404)
+        # 新链接可正常撤回；主持台同步显示
+        self.assertEqual(self.consent(self.client, new_jia, False).status_code, 200)
+        reviewers = host_state(self.client, self.host_token)["reviewers"]
+        self.assertEqual(
+            [r["collection_consent"] for r in reviewers], [False, False, False]
+        )
+
+    def test_close_blocks_writes_but_collection_stays_readable(self):
+        self.published()
+        for tok in self.tokens:
+            self.consent(self.client, tok, True)
+        url = self.publish_collection(self.client, self.host_token, ["乙", "甲"]).get_json()[
+            "url"
+        ]
+        self.assertEqual(close_session(self.client, self.host_token).status_code, 200)
+        # 封存后：授权变更与发布均 409（统一封存错误）
+        self.assertEqual(self.consent(self.client, self.t_jia, False).status_code, 409)
+        self.assertEqual(self.consent(self.client, self.t_bing, True).status_code, 409)
+        self.assertEqual(
+            self.publish_collection(self.client, self.host_token, ["甲"]).status_code, 409
+        )
+        # 封存后合辑仍可读，内容不变
+        resp = self.client.get(f"/api{url}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.get_json()["items"],
+            [{"number": 1, "manuscript": "文本一"}, {"number": 2, "manuscript": "文本二"}],
+        )
+        # 无效链接仍 404（而非封存的 409）
+        self.assertEqual(self.consent(self.client, "不存在的token", True).status_code, 404)
+        self.assertEqual(self.client.get("/api/c/不存在的token").status_code, 404)
+
+    def test_close_before_any_collection_blocks_everything(self):
+        self.published()
+        self.assertEqual(close_session(self.client, self.host_token).status_code, 200)
+        self.assertEqual(self.consent(self.client, self.t_jia, True).status_code, 409)
+        self.assertEqual(
+            self.publish_collection(self.client, self.host_token, ["甲"]).status_code, 409
+        )
+        self.assertEqual(self.collections_count(), 0)
+        self.assertFalse(state(self.client, self.t_jia)["collection_consent"])
+
+    def test_withdraw_first_then_publish_fails(self):
+        """撤回先提交：发布在其后继续，看到入选作者已撤回 → 整次 409，不留合辑。"""
+        self.published()
+        for tok in self.tokens:
+            self.assertEqual(self.consent(self.client, tok, True).status_code, 200)
+        withdraw_entered = threading.Event()
+        release_withdraw = threading.Event()
+        publish_begin = threading.Event()
+        tls = threading.local()
+        armed = {"withdraw": True}
+
+        def hook(_wrapper, sql):
+            if armed["withdraw"] and "UPDATE PARTICIPANTS SET COLLECTION_CONSENT" in sql.upper():
+                armed["withdraw"] = False
+                withdraw_entered.set()
+                self.assertTrue(release_withdraw.wait(10), "撤回未被释放")
+
+        def pre_hook(_wrapper, sql):
+            if getattr(tls, "publisher", False) and sql.lstrip().upper().startswith("BEGIN IMMEDIATE"):
+                # 发布即将在写锁上排队；此时撤回仍未提交
+                self.assertFalse(release_withdraw.is_set())
+                publish_begin.set()
+
+        result = {}
+
+        def withdrawer():
+            tls.withdrawer = True
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["withdraw"] = self.consent(new_client(), self.t_yi, False).status_code
+
+        t = threading.Thread(target=withdrawer)
+        t.start()
+        self.assertTrue(withdraw_entered.wait(10), "撤回未进入更新阶段")
+
+        def publisher():
+            tls.publisher = True
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["publish"] = self.publish_collection(
+                    new_client(), self.host_token, ["甲", "乙", "丙"]
+                ).status_code
+
+        w = threading.Thread(target=publisher)
+        w.start()
+        self.assertTrue(publish_begin.wait(10), "发布未发起写事务")
+        time.sleep(0.2)
+        self.assertNotIn("publish", result, "发布不应在撤回提交前完成")
+        release_withdraw.set()
+        t.join(10)
+        w.join(10)
+        self.assertFalse(t.is_alive() or w.is_alive())
+        self.assertEqual(result["withdraw"], 200)
+        # 撤回已生效：发布看到乙未授权，整次 409，不留合辑
+        self.assertEqual(result["publish"], 409)
+        self.assertEqual(self.collections_count(), 0)
+        self.assertIsNone(host_state(self.client, self.host_token)["collection"])
+        self.assertFalse(state(self.client, self.t_yi)["collection_consent"])
+
+    def test_publish_first_then_consents_frozen_and_repeat_409(self):
+        """发布先提交：后排队的授权变更与重复发布均 409；合辑已生成且内容不变。"""
+        self.published()
+        for tok in self.tokens:
+            self.assertEqual(self.consent(self.client, tok, True).status_code, 200)
+        publish_entered = threading.Event()
+        release_publish = threading.Event()
+        consent_begin = threading.Event()
+        tls = threading.local()
+        armed = {"publish": True}
+
+        def hook(_wrapper, sql):
+            if armed["publish"] and sql.lstrip().upper().startswith("INSERT INTO COLLECTION_ITEMS"):
+                armed["publish"] = False
+                publish_entered.set()
+                self.assertTrue(release_publish.wait(10), "发布未被释放")
+
+        def pre_hook(_wrapper, sql):
+            if getattr(tls, "consenter", False) and sql.lstrip().upper().startswith("BEGIN IMMEDIATE"):
+                # 授权变更即将在写锁上排队；此时发布仍未提交
+                self.assertFalse(release_publish.is_set())
+                consent_begin.set()
+
+        result = {}
+
+        def publisher():
+            tls.publisher = True
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["publish"] = self.publish_collection(
+                    new_client(), self.host_token, ["甲", "乙", "丙"]
+                ).status_code
+
+        t = threading.Thread(target=publisher)
+        t.start()
+        self.assertTrue(publish_entered.wait(10), "发布未进入写入阶段")
+
+        def consenter():
+            tls.consenter = True
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["consent"] = self.consent(new_client(), self.t_jia, False).status_code
+
+        w = threading.Thread(target=consenter)
+        w.start()
+        self.assertTrue(consent_begin.wait(10), "授权变更未发起写事务")
+        time.sleep(0.2)
+        self.assertNotIn("consent", result, "授权变更不应在发布提交前完成")
+        release_publish.set()
+        t.join(10)
+        w.join(10)
+        self.assertFalse(t.is_alive() or w.is_alive())
+        self.assertEqual(result["publish"], 200)
+        # 发布先提交：授权冻结，排队的撤回 409；重复发布 409
+        self.assertEqual(result["consent"], 409)
+        self.assertEqual(
+            self.publish_collection(self.client, self.host_token, ["甲"]).status_code, 409
+        )
+        self.assertTrue(state(self.client, self.t_jia)["collection_consent"])
+        url = host_state(self.client, self.host_token)["collection"]["url"]
+        resp = self.client.get(f"/api{url}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.get_json()["items"]), 3)
+
+    def test_persistence_across_restart(self):
+        self.published()
+        self.consent(self.client, self.t_jia, True)
+        self.consent(self.client, self.t_yi, True)
+        url = self.publish_collection(self.client, self.host_token, ["乙", "甲"]).get_json()[
+            "url"
+        ]
+        # 模拟重启：幂等建表/补列，合辑与授权随原 SQLite 文件保留
+        app_module.init_db()
+        data = self.client.get(f"/api{url}").get_json()
+        self.assertEqual(
+            data["items"],
+            [{"number": 1, "manuscript": "文本一"}, {"number": 2, "manuscript": "文本二"}],
+        )
+        # 授权与冻结状态保留：变更与重复发布仍 409，主持台公开链接不变
+        self.assertTrue(state(self.client, self.t_jia)["collection_consent"])
+        self.assertFalse(state(self.client, self.t_bing)["collection_consent"])
+        self.assertEqual(self.consent(self.client, self.t_jia, False).status_code, 409)
+        self.assertEqual(
+            self.publish_collection(self.client, self.host_token, ["甲"]).status_code, 409
+        )
+        self.assertEqual(
+            host_state(self.client, self.host_token)["collection"]["url"], url
+        )
+
+
 class OldSchemaMigrationTest(unittest.TestCase):
-    """旧库启动时自动支持问答、换发、移除、回执、举报与封存存储：补表/补列/回填凭据，旧数据保留。"""
+    """旧库启动时自动支持问答、换发、移除、回执、举报、封存与合辑存储：补表/补列/回填凭据，旧数据保留。"""
 
     OLD_SCHEMA = """
     CREATE TABLE sessions (
@@ -2562,6 +2985,90 @@ class OldSchemaMigrationTest(unittest.TestCase):
             self.assertTrue(client.get("/api/p/tk").get_json()["closed"])
             self.assertEqual(ack(client, "tk").status_code, 409)
             self.assertEqual(close_session(client, "ht").status_code, 409)
+        finally:
+            app_module.DB_PATH = original
+
+    def test_old_db_collection_auto_supported(self):
+        """旧库启动时自动补建合辑表与授权列：既有成员初始未授权；授权/发布/公开读可用，重启保留。"""
+        tmp_dir = tempfile.mkdtemp(prefix="review-olddb-collection-")
+        old_path = os.path.join(tmp_dir, "old.db")
+        conn = sqlite3.connect(old_path)
+        conn.executescript(self.OLD_SCHEMA)
+        conn.execute("INSERT INTO sessions (id, host_token, published) VALUES (1,'ht',1)")
+        conn.execute(
+            "INSERT INTO participants (id, session_id, token, name, position, manuscript, version)"
+            " VALUES (1,1,'tk','旧库作者',0,'旧稿',1)"
+        )
+        conn.execute(
+            "INSERT INTO reviews (id, session_id, reviewer_id, target_id, target_version, content, valid)"
+            " VALUES (1,1,1,1,1,'旧意见',1)"
+        )
+        conn.commit()
+        conn.close()
+
+        original = app_module.DB_PATH
+        app_module.DB_PATH = old_path
+        try:
+            app_module.init_db()
+            c = sqlite3.connect(old_path)
+            try:
+                tables = {
+                    r[0]
+                    for r in c.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                cols = {r[1] for r in c.execute("PRAGMA table_info(participants)")}
+                consent_values = {
+                    r[0] for r in c.execute("SELECT collection_consent FROM participants")
+                }
+            finally:
+                c.close()
+            self.assertIn("collections", tables)
+            self.assertIn("collection_items", tables)
+            self.assertIn("collection_consent", cols)
+            self.assertEqual(consent_values, {0})  # 既有成员一律未授权
+
+            client = new_client()
+            # 参与状态只含本人授权（初始未授权）；主持状态含各人授权与空合辑
+            self.assertFalse(client.get("/api/p/tk").get_json()["collection_consent"])
+            hs = client.get("/api/h/ht").get_json()
+            self.assertEqual(
+                [r["collection_consent"] for r in hs["reviewers"]], [False]
+            )
+            self.assertIsNone(hs["collection"])
+            # 旧库上直接授权并发布合辑：公开链接只含编号与稿文
+            self.assertEqual(
+                client.post(
+                    "/api/p/tk/collection-consent", json={"consent": True}
+                ).status_code,
+                200,
+            )
+            resp = client.post("/api/h/ht/collection", json={"names": ["旧库作者"]})
+            self.assertEqual(resp.status_code, 200, resp.get_json())
+            url = resp.get_json()["url"]
+            data = client.get(f"/api{url}").get_json()
+            self.assertEqual(data["items"], [{"number": 1, "manuscript": "旧稿"}])
+            body = client.get(f"/api{url}").get_data(as_text=True)
+            self.assertNotIn("旧库作者", body)
+            # 模拟重启：合辑、公开链接与授权冻结均保留
+            app_module.init_db()
+            self.assertEqual(client.get(f"/api{url}").status_code, 200)
+            self.assertEqual(
+                client.post(
+                    "/api/p/tk/collection-consent", json={"consent": False}
+                ).status_code,
+                409,
+            )
+            self.assertEqual(
+                client.post(
+                    "/api/h/ht/collection", json={"names": ["旧库作者"]}
+                ).status_code,
+                409,
+            )
+            self.assertEqual(
+                client.get("/api/h/ht").get_json()["collection"]["url"], url
+            )
         finally:
             app_module.DB_PATH = original
 
